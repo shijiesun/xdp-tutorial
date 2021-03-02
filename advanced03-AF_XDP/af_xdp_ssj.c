@@ -25,7 +25,6 @@
 #include <linux/ipv6.h>
 #include <linux/icmpv6.h>
 
-
 #include "../common/common_params.h"
 #include "../common/common_user_bpf_xdp.h"
 #include "../common/common_libbpf.h"
@@ -71,6 +70,56 @@ static inline __u32 xsk_ring_prod__free(struct xsk_ring_prod *r)
     r->cached_cons = *r->consumer + r->size;
     return r->cached_cons - r->cached_prod;
 }
+
+#ifndef PATH_MAX
+#define PATH_MAX    4096
+#endif
+
+const char *pin_basedir =  "/sys/fs/bpf";
+
+static int pin_maps_in_bpf_object(struct bpf_object *bpf_obj, const char *subdir, const char * map_name)
+{
+    char map_filename[PATH_MAX];
+    char pin_dir[PATH_MAX];
+    int err, len;
+
+    len = snprintf(pin_dir, PATH_MAX, "%s/%s", pin_basedir, subdir);
+    if (len < 0) {
+        fprintf(stderr, "ERR: creating pin dirname\n");
+        return EXIT_FAIL_OPTION;
+    }
+
+    len = snprintf(map_filename, PATH_MAX, "%s/%s/%s",
+                   pin_basedir, subdir, map_name);
+    if (len < 0) {
+        fprintf(stderr, "ERR: creating map_name\n");
+        return EXIT_FAIL_OPTION;
+    }
+
+    /* Existing/previous XDP prog might not have cleaned up */
+    if (access(map_filename, F_OK ) != -1 ) {
+        if (verbose)
+            printf(" - Unpinning (remove) prev maps in %s/\n",
+                   pin_dir);
+
+        /* Basically calls unlink(3) on map_filename */
+        err = bpf_object__unpin_maps(bpf_obj, pin_dir);
+        if (err) {
+            fprintf(stderr, "ERR: UNpinning maps in %s\n", pin_dir);
+            return EXIT_FAIL_BPF;
+        }
+    }
+    if (verbose)
+        printf(" - Pinning maps in %s/\n", pin_dir);
+
+    /* This will pin all maps in our bpf_object */
+    err = bpf_object__pin_maps(bpf_obj, pin_dir);
+    if (err)
+        return EXIT_FAIL_BPF;
+
+    return 0;
+}
+
 
 static const char *__doc__ = "AF_XDP kernel bypass example\n";
 
@@ -167,7 +216,8 @@ static uint64_t xsk_umem_free_frames(struct xsk_socket_info *xsk)
 }
 
 static struct xsk_socket_info *xsk_configure_socket(struct config *cfg,
-                            struct xsk_umem_info *umem)
+                                                    struct xsk_umem_info *umem,
+                                                    int xsks_map_fd)
 {
     struct xsk_socket_config xsk_cfg;
     struct xsk_socket_info *xsk_info;
@@ -197,6 +247,22 @@ static struct xsk_socket_info *xsk_configure_socket(struct config *cfg,
     if (ret)
         goto error_exit;
 
+    int xsk_fd = xsk_socket__fd(xsk_info->xsk);
+    printf("xsk_fd:%d\n", xsk_fd);
+
+//    xsks_map_fd = bpf_obj_get("/sys/fs/bpf/veth-adv03/xsks_map");
+//    printf("xsks_map_fd:%d\n", xsks_map_fd);
+
+    int key = 1;
+    int val = xsk_fd;
+
+    ret = bpf_map_update_elem(xsks_map_fd, &key, &val, 0);
+    printf("ret:%d %s\n", ret, strerror(-ret));
+
+    int val2 = 0;
+    bpf_map_lookup_elem(xsks_map_fd, &key, &val2);
+    printf("val:%d\n", val2);
+
     /* Initialize umem frame allocation */
 
     for (i = 0; i < NUM_FRAMES; i++)
@@ -225,6 +291,61 @@ error_exit:
     errno = -ret;
     return NULL;
 }
+
+static struct xsk_socket_info *xsk_configure_socket2(struct config *cfg,
+                                                     struct xsk_umem_info *umem,
+                                                     int xsks_map_fd)
+{
+    struct xsk_socket_config xsk_cfg;
+    struct xsk_socket_info *xsk_info;
+    uint32_t prog_id = 0;
+    int ret;
+
+    xsk_info = calloc(1, sizeof(*xsk_info));
+    if (!xsk_info)
+        return NULL;
+
+    xsk_info->umem = umem;
+    xsk_cfg.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
+    xsk_cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
+    xsk_cfg.libbpf_flags = 0;
+    xsk_cfg.xdp_flags = cfg->xdp_flags;
+    xsk_cfg.bind_flags = cfg->xsk_bind_flags;
+    ret = xsk_socket__create(&xsk_info->xsk, cfg->ifname,
+                             cfg->xsk_if_queue, umem->umem, &xsk_info->rx,
+                             &xsk_info->tx, &xsk_cfg);
+
+    if (ret)
+        goto error_exit;
+
+    ret = bpf_get_link_xdp_id(cfg->ifindex, &prog_id, cfg->xdp_flags);
+    if (ret)
+        goto error_exit;
+
+    int xsk_fd = xsk_socket__fd(xsk_info->xsk);
+    printf("xsk_fd:%d\n", xsk_fd);
+
+//    xsks_map_fd = bpf_obj_get("/sys/fs/bpf/veth-adv03/xsks_map");
+//    printf("xsks_map_fd:%d\n", xsks_map_fd);
+
+    int key = 2;
+    int val = xsk_fd;
+
+    ret = bpf_map_update_elem(xsks_map_fd, &key, &val, 0);
+    printf("ret:%d %s\n", ret, strerror(-ret));
+
+    int val2 = 0;
+    bpf_map_lookup_elem(xsks_map_fd, &key, &val2);
+    printf("val:%d\n", val2);
+
+
+    return xsk_info;
+
+error_exit:
+    errno = -ret;
+    return NULL;
+}
+
 
 static void complete_tx(struct xsk_socket_info *xsk)
 {
@@ -284,7 +405,7 @@ static bool process_packet(struct xsk_socket_info *xsk,
      *   ICMPV6_ECHO_REPLY
      * - Recalculate the icmp checksum */
 
-    if (false) {
+    if (true) {
         int ret;
         uint32_t tx_idx = 0;
         uint8_t tmp_mac[ETH_ALEN];
@@ -343,8 +464,9 @@ static void handle_receive_packets(struct xsk_socket_info *xsk)
     int ret;
 
     rcvd = xsk_ring_cons__peek(&xsk->rx, RX_BATCH_SIZE, &idx_rx);
-    if (!rcvd)
+    if (!rcvd) {
         return;
+    }
 
     /* Stuff the ring with as much frames as possible */
     stock_frames = xsk_prod_nb_free(&xsk->umem->fq,
@@ -386,22 +508,35 @@ static void handle_receive_packets(struct xsk_socket_info *xsk)
   }
 
 static void rx_and_process(struct config *cfg,
-               struct xsk_socket_info *xsk_socket)
+                           struct xsk_socket_info *xsk_info,
+                           struct xsk_socket_info *xsk_info2)
 {
     struct pollfd fds[2];
     int ret, nfds = 1;
 
     memset(fds, 0, sizeof(fds));
-    fds[0].fd = xsk_socket__fd(xsk_socket->xsk);
+    fds[0].fd = xsk_socket__fd(xsk_info->xsk);
     fds[0].events = POLLIN;
+
+    nfds = 2;
+    fds[1].fd = xsk_socket__fd(xsk_info2->xsk);
+    fds[1].events = POLLIN;
 
     while(!global_exit) {
         if (cfg->xsk_poll_mode) {
             ret = poll(fds, nfds, -1);
-            if (ret <= 0 || ret > 1)
+            printf("poll return %d\n", ret);
+            if (ret <= 0 || ret > 2)
                 continue;
         }
-        handle_receive_packets(xsk_socket);
+        if(fds[0].revents) {
+            printf("rcv events from fd:0\n");
+            handle_receive_packets(xsk_info);
+        } else {
+            printf("rcv events from fd:1\n");
+            handle_receive_packets(xsk_info2);
+        }
+
     }
 }
 
@@ -510,7 +645,7 @@ int main(int argc, char **argv)
         .progsec = "xdp_sock"
     };
     struct xsk_umem_info *umem;
-    struct xsk_socket_info *xsk_socket;
+    struct xsk_socket_info *xsk_info, *xsk_info2;
     struct bpf_object *bpf_obj = NULL;
     pthread_t stats_poll_thread;
 
@@ -544,12 +679,15 @@ int main(int argc, char **argv)
         /* We also need to load the xsks_map */
         map = bpf_object__find_map_by_name(bpf_obj, "xsks_map");
         xsks_map_fd = bpf_map__fd(map);
+        printf("xsks_map_fd:%d\n", xsks_map_fd);
         if (xsks_map_fd < 0) {
             fprintf(stderr, "ERROR: no xsks map found: %s\n",
                 strerror(xsks_map_fd));
             exit(EXIT_FAILURE);
         }
     }
+
+//    pin_maps_in_bpf_object(bpf_obj, cfg.ifname, "xsks_map");
 
     /* Allow unlimited locking of memory, so all memory needed for packet
      * buffers can be locked.
@@ -579,17 +717,24 @@ int main(int argc, char **argv)
     }
 
     /* Open and configure the AF_XDP (xsk) socket */
-    xsk_socket = xsk_configure_socket(&cfg, umem);
-    if (xsk_socket == NULL) {
+    xsk_info = xsk_configure_socket(&cfg, umem, xsks_map_fd);
+    if (xsk_info == NULL) {
         fprintf(stderr, "ERROR: Can't setup AF_XDP socket \"%s\"\n",
             strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    xsk_info2 = xsk_configure_socket2(&cfg, umem, xsks_map_fd);
+    if (xsk_info2 == NULL) {
+        fprintf(stderr, "ERROR: Can't setup AF_XDP socket \"%s\"\n",
+                strerror(errno));
         exit(EXIT_FAILURE);
     }
 
     /* Start thread to do statistics display */
     if (verbose) {
         ret = pthread_create(&stats_poll_thread, NULL, stats_poll,
-                     xsk_socket);
+                     xsk_info);
         if (ret) {
             fprintf(stderr, "ERROR: Failed creating statistics thread "
                 "\"%s\"\n", strerror(errno));
@@ -598,10 +743,10 @@ int main(int argc, char **argv)
     }
 
     /* Receive and count packets than drop them */
-    rx_and_process(&cfg, xsk_socket);
+    rx_and_process(&cfg, xsk_info, xsk_info2);
 
     /* Cleanup */
-    xsk_socket__delete(xsk_socket->xsk);
+    xsk_socket__delete(xsk_info->xsk);
     xsk_umem__delete(umem->umem);
     xdp_link_detach(cfg.ifindex, cfg.xdp_flags, 0);
 
